@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
-    { name = "TokenForge Contributors" }
+    { name = "Oluwatosin Amokeodo", email = "oluwatosin.amokeodo@gmail.com"}
 ]
 keywords = [
     "django",
@@ -67,11 +67,11 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/django-tokenforge"
-Documentation = "https://github.com/your-org/django-tokenforge#readme"
-Repository = "https://github.com/your-org/django-tokenforge.git"
-"Bug Tracker" = "https://github.com/your-org/django-tokenforge/issues"
-Changelog = "https://github.com/your-org/django-tokenforge/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/Threx-code/tokenforge"
+Documentation = "https://github.com/Threx-code/tokenforge#readme"
+Repository = "https://github.com/Threx-code/tokenforge.git"
+"Bug Tracker" = "https://github.com/Threx-code/tokenforge/issues"
+Changelog = "https://github.com/Threx-code/tokenforge/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["."]
