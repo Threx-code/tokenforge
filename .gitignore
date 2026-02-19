@@ -50,3 +50,4 @@ dmypy.json
 *.env
 .env.local
 local_settings.py
+Makefile
