@@ -2,9 +2,8 @@ name: CI
 
 on:
   push:
-    branches: ["main", "develop"]
-  pull_request:
-    branches: ["main", "develop"]
+    branches: ["**"]        # run on every branch (main, v1, v2, feature/*, …)
+  pull_request:             # and on PRs targeting any branch
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,6 +19,9 @@ jobs:
   lint:
     name: Lint & Format (ruff)
     runs-on: ubuntu-latest
+    # Avoid double runs: on same-repo PRs the push event already covers it;
+    # only run the pull_request event for forks.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +43,7 @@ jobs:
   typecheck:
     name: Type Check (mypy)
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v4
 
@@ -59,6 +62,7 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }})
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
 
     services:
       redis:
