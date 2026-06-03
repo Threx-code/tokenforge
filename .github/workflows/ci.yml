@@ -4,7 +4,6 @@ on:
   push:
     branches: ["**"]        # run on every branch (main, v1, v2, feature/*, …)
   pull_request:             # and on PRs targeting any branch
-  workflow_call:            # callable as a reusable workflow (used by publish.yml)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
