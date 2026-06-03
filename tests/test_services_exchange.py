@@ -2,16 +2,16 @@
 Tests for tokenforge.services.exchange — create, redeem, counters.
 """
 
-import pytest
-from django.core.cache import cache
+from contextlib import contextmanager
+from unittest import mock
 
-from tokenforge.services.exchange import (
-    count_active_exchange_tokens,
-    create_exchange_token,
-    decrement_exchange_counter,
-    increment_exchange_counter,
-    redeem_exchange_token,
-)
+import pytest
+from django.conf import settings as dj_settings
+from django.core.cache import cache
+from django.test import override_settings
+
+from tokenforge.services.exchange import ExchangeTokenService
+from tokenforge.settings import reload_settings
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -22,7 +22,7 @@ def make_exchange_token(
     fingerprint="fp-abc",
     target_origin="https://app.example.com",
 ):
-    return create_exchange_token(
+    return ExchangeTokenService.create(
         user_id=user_id,
         device_session_id=device_session_id,
         fingerprint=fingerprint,
@@ -30,15 +30,31 @@ def make_exchange_token(
     )
 
 
+@contextmanager
+def tf_settings(**overrides):
+    merged = {**getattr(dj_settings, "TOKENFORGE", {}), **overrides}
+    cm = override_settings(TOKENFORGE=merged)
+    cm.enable()
+    reload_settings()
+    try:
+        yield
+    finally:
+        cm.disable()
+        reload_settings()
+
+
 @pytest.fixture(autouse=True)
 def clear_cache():
-    """Clear the cache before every test for isolation."""
+    """Clear the cache before every test for isolation, and allowlist the test
+    origin (exchange creation is fail-closed when EXCHANGE_ALLOWED_ORIGINS is
+    unset)."""
     cache.clear()
-    yield
+    with tf_settings(EXCHANGE_ALLOWED_ORIGINS=["https://app.example.com"]):
+        yield
     cache.clear()
 
 
-# ── create_exchange_token ─────────────────────────────────────────────────────
+# ── ExchangeTokenService.create ─────────────────────────────────────────────────────
 
 
 class TestCreateExchangeToken:
@@ -54,146 +70,141 @@ class TestCreateExchangeToken:
 
     def test_token_is_stored_in_cache(self):
         token = make_exchange_token()
-        from tokenforge.services.exchange import _cache_key
+        from tokenforge.tokens import OneTimeStore
 
-        assert cache.get(_cache_key(token)) is not None
+        assert cache.get(OneTimeStore("exchange")._key(token)) is not None
 
     def test_payload_contains_user_id(self):
         token = make_exchange_token(user_id="uid-999")
-        payload = redeem_exchange_token(token=token, request_origin="https://app.example.com")
+        payload = ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
         assert payload["sub"] == "uid-999"
 
     def test_payload_contains_session_id(self):
         token = make_exchange_token(device_session_id="sess-777")
-        payload = redeem_exchange_token(token=token, request_origin="https://app.example.com")
+        payload = ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
         assert payload["sid"] == "sess-777"
 
     def test_payload_contains_fingerprint(self):
         token = make_exchange_token(fingerprint="fp-stored")
-        payload = redeem_exchange_token(token=token, request_origin="https://app.example.com")
+        payload = ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
         assert payload["fp"] == "fp-stored"
 
     def test_target_origin_normalized_to_lowercase(self):
-        token = create_exchange_token(
+        token = ExchangeTokenService.create(
             user_id="u1",
             device_session_id="s1",
             target_origin="HTTPS://APP.EXAMPLE.COM",
         )
         # Redeeming with the lowercase form should work
-        payload = redeem_exchange_token(token=token, request_origin="https://app.example.com")
+        payload = ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
         assert payload["sub"] == "u1"
 
 
-# ── redeem_exchange_token ─────────────────────────────────────────────────────
+# ── ExchangeTokenService.redeem ─────────────────────────────────────────────────────
 
 
 class TestRedeemExchangeToken:
     def test_valid_token_returns_payload_dict(self):
         token = make_exchange_token()
-        payload = redeem_exchange_token(token=token, request_origin="https://app.example.com")
+        payload = ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
         assert isinstance(payload, dict)
         assert "sub" in payload
         assert "sid" in payload
 
     def test_token_is_single_use(self):
         token = make_exchange_token()
-        redeem_exchange_token(token=token, request_origin="https://app.example.com")
+        ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
         with pytest.raises(ValueError, match="invalid or expired"):
-            redeem_exchange_token(token=token, request_origin="https://app.example.com")
+            ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
 
     def test_invalid_token_raises(self):
         with pytest.raises(ValueError, match="invalid or expired"):
-            redeem_exchange_token(
+            ExchangeTokenService.redeem(
                 token="this-token-does-not-exist",
                 request_origin="https://app.example.com",
             )
 
     def test_empty_token_raises(self):
         with pytest.raises(ValueError, match="required"):
-            redeem_exchange_token(token="", request_origin="https://app.example.com")
+            ExchangeTokenService.redeem(token="", request_origin="https://app.example.com")
 
     def test_origin_mismatch_raises(self):
         token = make_exchange_token(target_origin="https://app.example.com")
         with pytest.raises(ValueError, match="origin mismatch"):
-            redeem_exchange_token(token=token, request_origin="https://evil.example.com")
+            ExchangeTokenService.redeem(token=token, request_origin="https://evil.example.com")
 
     def test_missing_origin_header_raises_when_target_set(self):
         token = make_exchange_token(target_origin="https://app.example.com")
         with pytest.raises(ValueError, match="origin verification failed"):
-            redeem_exchange_token(token=token, request_origin="")
+            ExchangeTokenService.redeem(token=token, request_origin="")
 
     def test_origin_matching_succeeds(self):
         token = make_exchange_token(target_origin="https://app.example.com")
-        payload = redeem_exchange_token(token=token, request_origin="https://app.example.com")
+        payload = ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
         assert payload["sub"] == "user-123"
 
     def test_trailing_slash_in_request_origin_normalised(self):
         token = make_exchange_token(target_origin="https://app.example.com")
         # The normalizer strips trailing slashes
-        payload = redeem_exchange_token(token=token, request_origin="https://app.example.com/")
+        payload = ExchangeTokenService.redeem(
+            token=token, request_origin="https://app.example.com/"
+        )
         assert payload["sub"] == "user-123"
 
     def test_token_deleted_from_cache_after_redeem(self):
         token = make_exchange_token()
-        from tokenforge.services.exchange import _cache_key
+        from tokenforge.tokens import OneTimeStore
 
-        redeem_exchange_token(token=token, request_origin="https://app.example.com")
-        assert cache.get(_cache_key(token)) is None
+        ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
+        assert cache.get(OneTimeStore("exchange")._key(token)) is None
 
     def test_token_deleted_even_on_origin_mismatch(self):
         """Token is consumed (deleted) before origin check so it cannot be retried."""
         token = make_exchange_token(target_origin="https://app.example.com")
-        from tokenforge.services.exchange import _cache_key
+        from tokenforge.tokens import OneTimeStore
 
         with pytest.raises(ValueError):
-            redeem_exchange_token(token=token, request_origin="https://evil.example.com")
+            ExchangeTokenService.redeem(token=token, request_origin="https://evil.example.com")
         # Token must be gone from cache
-        assert cache.get(_cache_key(token)) is None
+        assert cache.get(OneTimeStore("exchange")._key(token)) is None
 
 
-# ── counter helpers ───────────────────────────────────────────────────────────
+# ── active-token count (onetime-backed, pruned-on-read) ───────────────────────
 
 
-class TestExchangeCounters:
+class TestExchangeActiveCount:
     def test_initial_count_is_zero(self):
-        assert count_active_exchange_tokens("user-new") == 0
+        assert ExchangeTokenService.count_active("user-new") == 0
 
-    def test_increment_increases_count(self):
-        increment_exchange_counter("user-abc")
-        assert count_active_exchange_tokens("user-abc") == 1
+    def test_create_increases_count(self):
+        make_exchange_token(user_id="user-abc")
+        assert ExchangeTokenService.count_active("user-abc") == 1
 
-    def test_multiple_increments(self):
+    def test_multiple_creates(self):
         for _ in range(3):
-            increment_exchange_counter("user-multi")
-        assert count_active_exchange_tokens("user-multi") == 3
+            make_exchange_token(user_id="user-multi")
+        assert ExchangeTokenService.count_active("user-multi") == 3
 
-    def test_decrement_decreases_count(self):
-        increment_exchange_counter("user-dec")
-        increment_exchange_counter("user-dec")
-        decrement_exchange_counter("user-dec")
-        assert count_active_exchange_tokens("user-dec") == 1
-
-    def test_decrement_to_zero_removes_key(self):
-        increment_exchange_counter("user-zero")
-        decrement_exchange_counter("user-zero")
-        assert count_active_exchange_tokens("user-zero") == 0
-
-    def test_decrement_on_missing_key_does_not_raise(self):
-        # Should not raise even when counter key doesn't exist
-        decrement_exchange_counter("user-nonexistent")
-
-    def test_redeem_decrements_counter(self):
-        """Redeeming a token should automatically decrement the counter."""
-        increment_exchange_counter("user-123")
-        assert count_active_exchange_tokens("user-123") == 1
+    def test_redeem_releases_count(self):
         token = make_exchange_token(user_id="user-123")
-        redeem_exchange_token(token=token, request_origin="https://app.example.com")
-        assert count_active_exchange_tokens("user-123") == 0
+        assert ExchangeTokenService.count_active("user-123") == 1
+        ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
+        assert ExchangeTokenService.count_active("user-123") == 0
 
-    def test_counter_decremented_even_on_origin_failure(self):
-        """Counter must be decremented even when origin validation fails."""
-        increment_exchange_counter("user-123")
+    def test_count_released_even_on_origin_failure(self):
+        """The active count is released even when redemption fails validation."""
         token = make_exchange_token(user_id="user-123", target_origin="https://app.example.com")
+        assert ExchangeTokenService.count_active("user-123") == 1
         with pytest.raises(ValueError):
-            redeem_exchange_token(token=token, request_origin="https://evil.example.com")
-        assert count_active_exchange_tokens("user-123") == 0
+            ExchangeTokenService.redeem(token=token, request_origin="https://evil.example.com")
+        assert ExchangeTokenService.count_active("user-123") == 0
+
+    def test_expired_token_stops_counting(self):
+        """The drift fix: an unredeemed token that times out no longer counts
+        (the old integer counter would have stayed incremented forever)."""
+        real_now = __import__("time").time()
+        make_exchange_token(user_id="user-exp")
+        assert ExchangeTokenService.count_active("user-exp") == 1
+        # Jump past the exchange TTL — the pruned-on-read set drops it.
+        with mock.patch("tokenforge.tokens.onetime.time.time", return_value=real_now + 10_000):
+            assert ExchangeTokenService.count_active("user-exp") == 0

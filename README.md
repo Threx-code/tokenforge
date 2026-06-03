@@ -41,7 +41,7 @@ Designed as a security-first drop-in replacement for `django-rest-knox` when you
 | **Device fingerprinting** | SHA-256(IP + User-Agent) binding with configurable soft/strict enforcement |
 | **Safe X-Forwarded-For** | `NUM_PROXIES`-aware IP extraction — not blindly trusting the leftmost XFF value |
 | **Anti-CSRF** | `X-Requested-With: XMLHttpRequest` required on the refresh endpoint |
-| **Django signals** | `token_rotated`, `token_revoked`, `replay_detected` |
+| **Django signals** | `TokenSignals.rotated`, `TokenSignals.revoked`, `TokenSignals.replay_detected` |
 | **Knox-style settings** | Single `TOKENFORGE = {}` dict — no scattered settings |
 | **Admin integration** | Refresh tokens visible in Django admin; token hash never exposed |
 
@@ -85,7 +85,7 @@ Second refresh →  RefreshToken B revoked
                   RefreshToken C created  (family = F1)
 
 Attacker replays A  →  Entire family F1 revoked (A, B, C)
-                        replay_detected signal fired
+                        TokenSignals.replay_detected signal fired
                         RISK_EVENT_HANDLER called (if configured)
 ```
 
@@ -172,7 +172,7 @@ TOKENFORGE_SIGNING_KEY=your_generated_value_here
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "tokenforge.authentication.BearerTokenAuthentication",
+        "tokenforge.security.authentication.BearerTokenAuthentication",
     ],
 }
 
@@ -200,21 +200,21 @@ This registers three endpoints — see [Endpoints](#endpoints) for full details.
 TokenForge does not include a login view — authentication is your application's responsibility. After verifying credentials and any MFA, issue tokens like this:
 
 ```python
-from tokenforge.tokens import create_access_token
-from tokenforge.services.refresh import create_refresh_token
-from tokenforge.cookies import set_refresh_cookie
-from tokenforge.fingerprinting import fingerprint_for_request
+from tokenforge.tokens import AccessToken
+from tokenforge.services.refresh import RefreshTokenService
+from tokenforge.security.cookies import RefreshCookie
+from tokenforge.security.fingerprinting import RequestFingerprint
 
 def my_login_view(request, user):
-    fingerprint = fingerprint_for_request(request)
+    fingerprint = RequestFingerprint(request).compute()
 
-    raw_refresh, refresh_instance = create_refresh_token(
+    raw_refresh, refresh_instance = RefreshTokenService.create(
         user=user,
         fingerprint=fingerprint,
         # device_session=device_session_instance,  # optional
     )
 
-    access_token, expires_in = create_access_token(
+    access_token, expires_in = AccessToken.create(
         user_id=str(user.id),
         fingerprint=fingerprint,
         # device_session_id=str(device_session.id),  # optional
@@ -225,7 +225,7 @@ def my_login_view(request, user):
         "access_token": access_token,
         "expires_in": expires_in,
     })
-    set_refresh_cookie(response, raw_refresh)
+    RefreshCookie(response).set(raw_refresh)
     return response
 ```
 
@@ -250,24 +250,24 @@ class MyProtectedView(APIView):
 ### Revoke Tokens (Logout)
 
 ```python
-from tokenforge.services.refresh import revoke_all_for_user, revoke_by_device_session
-from tokenforge.cookies import expire_refresh_cookie
+from tokenforge.services.refresh import RefreshTokenService
+from tokenforge.security.cookies import RefreshCookie
 
 # Single-device logout — revoke only the current session's tokens
 def logout_view(request):
     session_id = request.auth.get("sid")
     if session_id:
         device_session = MyDeviceSession.objects.get(id=session_id)
-        revoke_by_device_session(device_session)
+        RefreshTokenService.revoke_by_device_session(device_session)
     response = Response({"detail": "Logged out."})
-    expire_refresh_cookie(response)
+    RefreshCookie(response).expire()
     return response
 
 # All-device logout — revoke every refresh token for this user
 def logout_all_view(request):
-    revoke_all_for_user(request.user)
+    RefreshTokenService.revoke_all_for_user(request.user)
     response = Response({"detail": "Logged out from all devices."})
-    expire_refresh_cookie(response)
+    RefreshCookie(response).expire()
     return response
 ```
 
@@ -294,20 +294,25 @@ TOKENFORGE = {
     "REFRESH_TOKEN_COOKIE_SECURE": True,          # Secure by default; set False only for local dev
     "REFRESH_TOKEN_COOKIE_SAMESITE": "Lax",
     "REFRESH_TOKEN_COOKIE_DOMAIN": None,          # None = host-only; ".example.com" for cross-subdomain
+    "USE_SECURE_COOKIE_PREFIX": True,             # `__Secure-` prefix (auto-skipped when COOKIE_SECURE=False)
     "TOKEN_MODEL": "tokenforge.RefreshToken",
 
     # ── Exchange Token ────────────────────────────────────────────────────────
     "EXCHANGE_TOKEN_TTL_SECONDS": 60,
     "EXCHANGE_TOKEN_BYTES": 48,                   # 384 bits of entropy
     "EXCHANGE_TOKEN_MAX_ACTIVE": 5,               # Max concurrent tokens per user
+    # FAIL-CLOSED: unset/empty refuses all exchange creation (403). List your subdomains.
+    "EXCHANGE_ALLOWED_ORIGINS": None,
+    "EXCHANGE_FINGERPRINT_STRICT": True,          # Reject redemption from a different device
 
     # ── Security ──────────────────────────────────────────────────────────────
     "FINGERPRINT_ENABLED": True,
-    # False (default) = soft-warn on access token fingerprint drift.
-    # True = hard-fail. Only enable if your users have stable IPs
-    # (e.g. internal tools behind a fixed VPN). Mobile/SPA users on
-    # cellular will hit spurious logouts if this is True.
-    # Hard-fail is always enforced at refresh token rotation regardless.
+    "FINGERPRINT_COMPONENTS": ["ua"],             # UA-only (network-stable); add "ip" for fixed-IP fleets
+    # Refresh rotation hard-fails on fingerprint drift (2.0 default). The mobile
+    # view opts out automatically; set False here for 1.x monitor-only behaviour.
+    "FINGERPRINT_STRICT_REFRESH": True,
+    # Access-token drift is soft-warn by default. True = hard-fail; only for
+    # stable-IP fleets (internal tools behind a fixed VPN), never mobile/SPA.
     "FINGERPRINT_STRICT_ACCESS_TOKEN": False,
     "REPLAY_DETECTION_ENABLED": True,
     "RISK_SCORE_THRESHOLD": 60,   # Block refresh if device session risk_score >= threshold
@@ -320,7 +325,7 @@ TOKENFORGE = {
     "DEVICE_SESSION_VALIDATOR": None,  # fn(device_session) -> None or raise ValueError
     "DEVICE_SESSION_LOADER": None,     # fn(session_id, user) -> session or None
     "USER_SERIALIZER": None,           # DRF Serializer class for exchange redeem response
-    "FINGERPRINT_FUNCTION": "tokenforge.fingerprinting.fingerprint_for_request",
+    "FINGERPRINT_FUNCTION": None,   # None = built-in RequestFingerprint; or any callable fn(request)->str
 
     # ── Anti-CSRF ─────────────────────────────────────────────────────────────
     "REQUIRE_XHR_HEADER": True,  # Require X-Requested-With: XMLHttpRequest on /token/refresh/
@@ -332,20 +337,28 @@ TOKENFORGE = {
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `ACCESS_TOKEN_LIFETIME_SECONDS` | `int` | `900` | Access token validity window in seconds |
-| `ACCESS_TOKEN_SIGNING_KEY` | `str` | `None` | **Required.** Dedicated HMAC-SHA256 signing key. Never share with `SECRET_KEY` |
+| `ACCESS_TOKEN_SIGNING_KEY` | `str` | `None` | **Required.** Dedicated HMAC-SHA256 signing key (≥ 32 bytes). Never share with `SECRET_KEY` |
+| `ACCESS_TOKEN_DENYLIST_ENABLED` | `bool` | `False` | Kill-switch: every token carries a `jti`; the auth path checks a Redis denylist so logout/compromise revokes a token immediately (one cache GET/request) |
 | `REFRESH_TOKEN_LIFETIME_DAYS` | `int` | `30` | Refresh token validity in days |
 | `REFRESH_TOKEN_BYTES` | `int` | `48` | Entropy bytes for refresh token generation (384 bits) |
 | `REFRESH_TOKEN_COOKIE_NAME` | `str` | `"refresh_token"` | Cookie name for the refresh token |
 | `REFRESH_TOKEN_COOKIE_PATH` | `str` | `"/api/v1/auth/token/refresh/"` | Cookie path scope — browser only sends cookie to this path |
 | `REFRESH_TOKEN_COOKIE_SECURE` | `bool` | `True` | HTTPS-only cookie. Set `False` only in local dev |
 | `REFRESH_TOKEN_COOKIE_SAMESITE` | `str` | `"Lax"` | Cookie `SameSite` attribute |
-| `REFRESH_TOKEN_COOKIE_DOMAIN` | `str\|None` | `None` | `None` = host-only. Set `".example.com"` for cross-subdomain refresh |
+| `REFRESH_TOKEN_COOKIE_DOMAIN` | `str\|None` | `None` | `None` = host-only. Set `".example.com"` for cross-subdomain refresh (warned — see Security Notes). Domain set **and** `path="/"` is a hard error |
+| `USE_SECURE_COOKIE_PREFIX` | `bool` | `True` | Prefix the refresh cookie name with `__Secure-` so the browser rejects it unless Secure/HTTPS. Auto-skipped when `REFRESH_TOKEN_COOKIE_SECURE=False` (local dev) |
+| `REFRESH_REUSE_GRACE_SECONDS` | `int` | `0` | Grace window for a legit refresh double-submit/retry. `>0` rotates the current token instead of treating the reuse as a replay |
+| `MAX_ACTIVE_REFRESH_TOKENS_PER_USER` | `int\|None` | `None` | Cap on concurrent active refresh tokens (≈ sessions) per user. Oldest are revoked on a new login beyond the cap |
 | `TOKEN_MODEL` | `str` | `"tokenforge.RefreshToken"` | Dotted path to the active refresh token model |
 | `EXCHANGE_TOKEN_TTL_SECONDS` | `int` | `60` | Exchange token lifetime in seconds |
 | `EXCHANGE_TOKEN_BYTES` | `int` | `48` | Entropy bytes for exchange token generation |
 | `EXCHANGE_TOKEN_MAX_ACTIVE` | `int` | `5` | Maximum concurrent active exchange tokens per user |
+| `EXCHANGE_ALLOWED_ORIGINS` | `list[str]\|None` | `None` | Allowlist of permitted exchange `target_origin` values. **Fail-closed:** `None`/empty **refuses** all creation (view returns `403`). Set to your known subdomains to use the exchange flow |
+| `EXCHANGE_FINGERPRINT_STRICT` | `bool` | `True` | Hard-fail exchange redemption when the redeeming request's fingerprint doesn't match the one bound at creation |
 | `FINGERPRINT_ENABLED` | `bool` | `True` | Enable device fingerprint computation and binding |
+| `FINGERPRINT_COMPONENTS` | `list[str]` | `["ua"]` | Which request parts form the fingerprint. Default `["ua"]` is network-stable (survives mobile WiFi↔LTE / VPN). Add `"ip"` only for stable, trusted client IPs |
 | `FINGERPRINT_STRICT_ACCESS_TOKEN` | `bool` | `False` | Hard-fail on access token fingerprint drift. Off by default — see [Security Notes](#security-notes) |
+| `FINGERPRINT_STRICT_REFRESH` | `bool` | `True` | Hard-fail refresh **rotation** on fingerprint drift (on by default in 2.0). Paired with `FINGERPRINT_COMPONENTS=["ua"]`; **automatically off for the mobile path** (see `MobileTokenRefreshView`). Set `False` for 1.x monitor-only behaviour |
 | `REPLAY_DETECTION_ENABLED` | `bool` | `True` | Revoke entire token family when a revoked token is reused |
 | `RISK_SCORE_THRESHOLD` | `int` | `60` | Reject refresh rotation if `device_session.risk_score >= this` |
 | `BOT_SCORE_THRESHOLD` | `int` | `90` | Reject refresh rotation if `device_session.bot_score >= this` |
@@ -354,8 +367,9 @@ TOKENFORGE = {
 | `DEVICE_SESSION_VALIDATOR` | `str\|None` | `None` | Dotted path to device session validation function |
 | `DEVICE_SESSION_LOADER` | `str\|None` | `None` | Dotted path to device session loader function |
 | `USER_SERIALIZER` | `str\|None` | `None` | Dotted path to DRF Serializer for exchange redeem user payload |
-| `FINGERPRINT_FUNCTION` | `str` | `"tokenforge.fingerprinting.fingerprint_for_request"` | Dotted path to fingerprint computation function |
-| `REQUIRE_XHR_HEADER` | `bool` | `True` | Anti-CSRF: require `X-Requested-With: XMLHttpRequest` on `/token/refresh/` |
+| `FINGERPRINT_FUNCTION` | `str\|None` | `None` | Optional override — any callable `fn(request) -> str`. `None` uses the built-in `RequestFingerprint` |
+| `TENANT_RESOLVER` | `str\|None` | `None` | Dotted path to `fn(request, user) -> str\|None` resolving the access token `tnt` claim **server-side**. Never sourced from a client header |
+| `REQUIRE_XHR_HEADER` | `bool` | `True` | Anti-CSRF: require `X-Requested-With: XMLHttpRequest` on `/token/refresh/` (overridable per-view via `TokenRefreshView.require_xhr_header`) |
 
 ---
 
@@ -485,9 +499,94 @@ A rotated `refresh_token` cookie is set in the response.
 
 ---
 
+### `POST /api/v1/auth/mobile/token/refresh/`
+
+Body-based refresh for **native mobile clients** (`MobileTokenRefreshView`).
+Unlike the web endpoint, the token travels in the request body and the rotated
+token is returned in the body — mobile apps persist it in secure device storage,
+not a cookie. The full rotation pipeline (replay detection, session validation,
+rotation) still runs.
+
+**Required headers:**
+
+```
+X-Client-Platform: mobile
+```
+
+`X-Requested-With` is **not** required (no ambient cookie → no CSRF surface).
+
+**Request:**
+
+```json
+{ "refresh_token": "<value from secure storage>" }
+```
+
+**Response `200 OK`:** (no `Set-Cookie` is issued)
+
+```json
+{
+    "access_token": "<new_access_token>",
+    "expires_in": 900,
+    "refresh_token": "<rotated token — overwrite secure storage>"
+}
+```
+
+**Response `400 Bad Request`** — not a mobile client, or the refresh cookie was
+present (a real mobile client never sends it).
+
+**Fingerprint:** the mobile path sets `strict_fingerprint = False` — mobile
+IP/UA is unstable (WiFi↔LTE, carrier NAT), so device binding belongs on the
+device session, not the fingerprint. Override `pre_rotation_guard(request,
+raw_token)` in a subclass to enforce app-specific device binding (e.g. matching
+a device-id header against the session) — that logic depends on your
+device-session schema, so it stays in your project:
+
+```python
+# myapp/views.py
+from rest_framework.response import Response
+from rest_framework import status
+from tokenforge.api.views import MobileTokenRefreshView
+
+
+class AppMobileRefreshView(MobileTokenRefreshView):
+    def pre_rotation_guard(self, request, raw_token):
+        # Return a Response to reject (revoke first if you wish), or None to proceed.
+        if not device_id_matches_session(request, raw_token):
+            return Response({"detail": "Device mismatch"}, status=status.HTTP_401_UNAUTHORIZED)
+        return None
+```
+
+---
+
+### `POST /api/v1/auth/logout/`
+
+Single-session logout. Revokes this session's refresh-token family and — when
+`ACCESS_TOKEN_DENYLIST_ENABLED` is on — denylists the presented access token's
+`jti` for its remaining lifetime. Clears the refresh cookie. Idempotent.
+
+**Request:** the refresh token from the `refresh_token` cookie (web) or the body
+(`{"refresh_token": "..."}`, mobile). Include `Authorization: Bearer <access>` so
+the access token can be denylisted.
+
+**Response `204 No Content`.**
+
+---
+
+### `POST /api/v1/auth/logout-all/`
+
+All-session logout for the authenticated user. Revokes **every** refresh token
+(no new access tokens can be minted) and denylists the current access token.
+Other sessions' access tokens expire within their lifetime.
+
+**Required:** `Authorization: Bearer <access_token>`.
+
+**Response `204 No Content`** — or `401`/`403` if unauthenticated.
+
+---
+
 ### `POST /api/v1/auth/exchange/create/`
 
-Create a one-time exchange token for cross-subdomain navigation. Requires a valid Bearer token.
+Create a one-time exchange token for cross-subdomain navigation. Requires a valid Bearer token. `target_origin` must be on `EXCHANGE_ALLOWED_ORIGINS` (fail-closed — when the allowlist is unset/empty, **every** request is refused).
 
 **Request body:**
 
@@ -495,6 +594,12 @@ Create a one-time exchange token for cross-subdomain navigation. Requires a vali
 {
     "target_origin": "https://admin.example.com"
 }
+```
+
+**Response `403 Forbidden`** — `target_origin` is not on `EXCHANGE_ALLOWED_ORIGINS` (or the allowlist is unset):
+
+```json
+{ "detail": "Exchange target origin is not allowed" }
 ```
 
 **Response `200 OK`:**
@@ -585,7 +690,7 @@ def record_risk_event(
         type=event_type,
         severity=severity,
         user=user,
-        ip=get_client_ip(request) if request else "",
+        ip=RequestFingerprint(request).client_ip() if request else "",
     )
 ```
 
@@ -639,7 +744,7 @@ Override the default IP + User-Agent fingerprinting entirely:
 def my_fingerprint(request) -> str:
     import hashlib
     parts = [
-        get_client_ip(request),
+        RequestFingerprint(request).client_ip(),
         request.META.get("HTTP_USER_AGENT", ""),
         request.META.get("HTTP_ACCEPT_LANGUAGE", ""),
     ]
@@ -657,16 +762,16 @@ TOKENFORGE = {
 ## Django Signals
 
 ```python
-from tokenforge.signals import token_rotated, token_revoked, replay_detected
+from tokenforge.signals import TokenSignals
 from django.dispatch import receiver
 
-@receiver(token_rotated)
+@receiver(TokenSignals.rotated)
 def on_rotation(sender, user, request, **kwargs):
     """Fired after a refresh token is successfully rotated."""
     logger.info("Token rotated for user %s", user.id)
 
 
-@receiver(token_revoked)
+@receiver(TokenSignals.revoked)
 def on_revocation(sender, family, count, reason, **kwargs):
     """
     Fired after tokens are revoked.
@@ -676,7 +781,7 @@ def on_revocation(sender, family, count, reason, **kwargs):
     logger.warning("Revoked %d tokens in family %s (reason: %s)", count, family, reason)
 
 
-@receiver(replay_detected)
+@receiver(TokenSignals.replay_detected)
 def on_replay(sender, user, family, request, **kwargs):
     """
     Fired when a revoked refresh token is reused.
@@ -689,20 +794,20 @@ def on_replay(sender, user, family, request, **kwargs):
 
 ## Cache Invalidation
 
-TokenForge caches User objects for `USER_CACHE_TTL` seconds (default 5 minutes) to eliminate per-request DB queries. When you deactivate a user, change their role, or modify permissions, call `invalidate_user_cache` so the next request gets a fresh DB lookup immediately:
+TokenForge caches User objects for `USER_CACHE_TTL` seconds (default 5 minutes) to eliminate per-request DB queries. When you deactivate a user, change their role, or modify permissions, call `UserCache.invalidate` so the next request gets a fresh DB lookup immediately:
 
 ```python
-from tokenforge.authentication import invalidate_user_cache
+from tokenforge.security.authentication import UserCache
 
 # After deactivating a user
 user.is_active = False
 user.save()
-invalidate_user_cache(str(user.id))
+UserCache.invalidate(str(user.id))
 
 # After changing roles or permissions
 user.role = "viewer"
 user.save()
-invalidate_user_cache(str(user.id))
+UserCache.invalidate(str(user.id))
 ```
 
 Set `USER_CACHE_TTL` to `0` to disable caching entirely if your application requires instant permission propagation on every request.
@@ -905,7 +1010,7 @@ Revoked and expired refresh tokens remain in the database for audit purposes. Ru
 ```python
 # tasks.py (Celery)
 from celery import shared_task
-from tokenforge.services.refresh import cleanup_expired_tokens
+from tokenforge.services.refresh import RefreshTokenService
 import logging
 
 logger = logging.getLogger(__name__)
@@ -913,7 +1018,7 @@ logger = logging.getLogger(__name__)
 @shared_task
 def cleanup_tokenforge_tokens():
     """Delete revoked tokens older than 90 days."""
-    count = cleanup_expired_tokens(older_than_days=90)
+    count = RefreshTokenService.cleanup_expired(older_than_days=90)
     logger.info("TokenForge cleanup: removed %d expired tokens", count)
     return count
 ```
@@ -934,18 +1039,22 @@ CELERY_BEAT_SCHEDULE = {
 
 ### Production Checklist
 
-- [ ] `ACCESS_TOKEN_SIGNING_KEY` is set to a **dedicated** key — not `SECRET_KEY`
+- [ ] `ACCESS_TOKEN_SIGNING_KEY` is set to a **dedicated** key — not `SECRET_KEY` — and is **≥ 32 bytes** (shorter keys raise `ImproperlyConfigured`)
 - [ ] `REFRESH_TOKEN_COOKIE_SECURE` is `True` (HTTPS only)
+- [ ] `USE_SECURE_COOKIE_PREFIX` is `True` (default) so the cookie carries the `__Secure-` prefix in production
 - [ ] `REFRESH_TOKEN_COOKIE_SAMESITE` is `"Lax"` or `"Strict"` — never `"None"` without `Secure`
+- [ ] `REFRESH_TOKEN_COOKIE_DOMAIN` is `None` (host-only) unless you have fully audited every `*.yourdomain` subdomain — and never combined with `path="/"` (hard error)
+- [ ] `EXCHANGE_ALLOWED_ORIGINS` lists your known subdomains if you use the exchange flow (creation is **fail-closed** otherwise)
 - [ ] `REQUIRE_XHR_HEADER` is `True`
 - [ ] `REPLAY_DETECTION_ENABLED` is `True`
+- [ ] `FINGERPRINT_STRICT_REFRESH` is `True` (default) for the web flow; verify it against your traffic (it is UA-only by default, so network changes are fine)
 - [ ] `RISK_EVENT_HANDLER` is configured for security monitoring
 - [ ] Redis is available and reachable (required for exchange tokens and user cache)
-- [ ] Periodic `cleanup_expired_tokens()` task is scheduled
+- [ ] Periodic `RefreshTokenService.cleanup_expired()` task is scheduled
 - [ ] `NUM_PROXIES` is set to the correct number of trusted proxy hops
 - [ ] `FINGERPRINT_STRICT_ACCESS_TOKEN` is `False` unless all your users have stable, fixed IPs
 - [ ] `x-requested-with` and `authorization` are in `CORS_ALLOW_HEADERS`
-- [ ] `CORS_ALLOW_CREDENTIALS = True`
+- [ ] `CORS_ALLOW_CREDENTIALS = True` with an explicit origin allowlist (never `*` with credentials)
 
 ### Key Separation
 
@@ -970,7 +1079,30 @@ With `NUM_PROXIES = 0` (default), `X-Forwarded-For` is ignored and `REMOTE_ADDR`
 
 ### Fingerprint Drift on Mobile
 
-The default fingerprint is `SHA-256(IP | User-Agent)`. Mobile users switch between WiFi and LTE, changing their IP mid-session. Access token fingerprint mismatches are logged as warnings but never cause a hard auth failure by default — the correct enforcement boundary is refresh token rotation, which always hard-fails on drift. Set `FINGERPRINT_STRICT_ACCESS_TOKEN = True` only for internal tools where all users have stable, predictable IPs.
+The 2.0 default fingerprint is `SHA-256(User-Agent)` — **UA-only** (`FINGERPRINT_COMPONENTS = ["ua"]`). This is deliberate: `FINGERPRINT_STRICT_REFRESH` is now **on by default**, so a refresh whose fingerprint drifts is *rejected*, and binding the IP would log out every web user on a legitimate network change (WiFi↔LTE, VPN, corporate proxy rotation). UA is stable across those.
+
+- **Web:** strict refresh-fingerprint enforcement is on. A mid-session browser User-Agent change (e.g. a browser auto-update) will force a single re-login — an accepted, rare trade-off. Set `FINGERPRINT_STRICT_REFRESH = False` to revert to monitor-only.
+- **Mobile:** `MobileTokenRefreshView` sets `strict_fingerprint = False` automatically — mobile IP/UA is unstable, and the real device boundary is the device session (`DEVICE_SESSION_VALIDATOR`) plus your `pre_rotation_guard` device-id check, not a network fingerprint.
+- Add `"ip"` to `FINGERPRINT_COMPONENTS` only for internal tools where all users have stable, predictable IPs.
+- Access-token fingerprint mismatches remain monitor-only (logged) unless `FINGERPRINT_STRICT_ACCESS_TOKEN = True`.
+
+### Cross-Subdomain Exchange: Token Delivery & CORS (SD-4, SD-6)
+
+The exchange flow hands a one-time token from the base domain to a subdomain. Two properties of the delivery channel matter:
+
+**Don't leak the token via the URL (SD-4).** A token in the query string (`?token=…`) leaks through the `Referer` header, browser history, and server access logs, and any third-party resource on the landing page can read it from the referrer. Prefer:
+
+- Deliver the token in the **URL fragment** (`#token=…`) — fragments are never sent to the server or included in `Referer` — and have the landing page read it from `location.hash`, then immediately `history.replaceState` it away. Or use a short-lived POST handoff.
+- Set `Referrer-Policy: no-referrer` (or at least `strict-origin`) on the redeem page.
+- This is defence in depth: even a leaked token is **device-bound** (SD-3, `EXCHANGE_FINGERPRINT_STRICT` on by default) and single-use with a 60-second TTL, so a leak is hard to weaponise — but don't rely on that alone.
+
+**Subdomains are same-site (SD-6).** `a.example.com` and `b.example.com` are the *same site*, so `SameSite=Lax/Strict` does **not** isolate them from each other — only the cookie's **Domain scope** (keep it host-only, see SD-1) and the exchange flow isolate subdomains. Credentialed cross-subdomain XHR additionally requires a **strict CORS origin allowlist**:
+
+- Never use `Access-Control-Allow-Origin: *` together with credentials, and never reflect the `Origin` header unchecked.
+- List exact origins in `CORS_ALLOWED_ORIGINS` and set `CORS_ALLOW_CREDENTIALS = True`.
+- This is also what makes `EXCHANGE_ALLOWED_ORIGINS` reachable as a control — keep the two allowlists consistent.
+
+CORS itself is owned by your app (`django-cors-headers`), but it gates whether the cookie/exchange protections above are actually effective.
 
 ### Scope of This Package
 
@@ -991,7 +1123,7 @@ TokenForge handles token lifecycle only. The following are intentionally out of 
 ### `tokenforge.tokens`
 
 ```python
-create_access_token(
+AccessToken.create(
     *,
     user_id: str,
     device_session_id: str = "",
@@ -1001,7 +1133,7 @@ create_access_token(
 # Returns: (token_string, expires_in_seconds)
 # Raises:  ImproperlyConfigured if ACCESS_TOKEN_SIGNING_KEY is not set
 
-verify_access_token(
+AccessToken.verify(
     token_string: str,
     *,
     request_fingerprint: str | None = None,
@@ -1013,7 +1145,7 @@ verify_access_token(
 ### `tokenforge.services.refresh`
 
 ```python
-create_refresh_token(
+RefreshTokenService.create(
     *,
     user,
     device_session=None,
@@ -1022,7 +1154,7 @@ create_refresh_token(
 ) -> tuple[str, RefreshToken]
 # Returns: (raw_token, RefreshToken instance)
 
-rotate_refresh_token(
+RefreshTokenService.rotate(
     *,
     raw_token: str,
     fingerprint: str = "",
@@ -1031,25 +1163,25 @@ rotate_refresh_token(
 # Returns: (new_raw_token, new_RefreshToken instance)
 # Raises:  ValueError on validation failure (expired, revoked, replay, device rejected)
 
-revoke_by_family(token_family: uuid.UUID, *, reason: str = "manual") -> int
+RefreshTokenService.revoke_by_family(token_family: uuid.UUID, *, reason: str = "manual") -> int
 # Returns: count of tokens revoked
 
-revoke_all_for_user(user) -> int
+RefreshTokenService.revoke_all_for_user(user) -> int
 # Returns: count of tokens revoked
 
-revoke_by_device_session(device_session) -> int
+RefreshTokenService.revoke_by_device_session(device_session) -> int
 # Returns: count of tokens revoked
 
-get_active_token_for_session(device_session) -> RefreshToken | None
+RefreshTokenService.get_active_token_for_session(device_session) -> RefreshToken | None
 
-cleanup_expired_tokens(*, older_than_days: int = 90) -> int
+RefreshTokenService.cleanup_expired(*, older_than_days: int = 90) -> int
 # Returns: count of tokens deleted
 ```
 
 ### `tokenforge.services.exchange`
 
 ```python
-create_exchange_token(
+ExchangeTokenService.create(
     *,
     user_id: str,
     device_session_id: str,
@@ -1058,49 +1190,70 @@ create_exchange_token(
 ) -> str
 # Returns: raw exchange token string
 
-redeem_exchange_token(
+ExchangeTokenService.redeem(
     *,
     token: str,
     request_origin: str = "",
+    request_fingerprint: str = "",   # compared to the bound fp; enforced when EXCHANGE_FINGERPRINT_STRICT
 ) -> dict
 # Returns: {sub, sid, fp, target_origin}
 # Raises:  ValueError on any validation failure
 
-count_active_exchange_tokens(user_id: str) -> int
-increment_exchange_counter(user_id: str) -> None
-decrement_exchange_counter(user_id: str) -> None
+ExchangeTokenService.count_active(user_id: str) -> int
+# Outstanding (non-expired) exchange tokens. Backed by tokenforge.onetime's
+# pruned-on-read active set — tracking happens inside create/redeem, so there
+# are no separate increment/decrement calls.
 ```
 
-### `tokenforge.authentication`
+### `tokenforge.tokens` — `OneTimeStore` / `AccessTokenDenylist`
+
+```python
+# Atomic single-use token store, scoped to a namespace (build cross-subdomain /
+# step-up grants on this). namespace is constructor state.
+store = OneTimeStore(namespace="onetime")
+store.create(payload: dict, *, ttl: int, nbytes=48) -> str
+store.claim(token: str) -> dict | None        # atomic get-and-delete; one winner under races
+
+# Accurate, self-pruning active-token cap (soft availability limit, per owner).
+store.track(owner: str, token: str, *, ttl: int) -> None
+store.untrack(owner: str, token: str) -> None
+store.count_active(owner: str) -> int
+
+# Access-token kill-switch denylist (M2).
+AccessTokenDenylist.add(jti: str, *, exp: int | None = None, ttl: int | None = None) -> None
+AccessTokenDenylist.contains(jti: str) -> bool
+```
+
+### `tokenforge.security.authentication`
 
 ```python
 class BearerTokenAuthentication(BaseAuthentication):
     # DRF authentication class.
     # Sets request.user and request.auth on success.
-    # request.auth keys: sub, sid, fp, tnt, iat, exp, v, token_type
+    # request.auth keys: sub, sid, fp, tnt, iat, exp, v, jti, token_type
 
-invalidate_user_cache(user_id: str) -> None
+UserCache.invalidate(user_id: str) -> None
 # Evict a user from the auth cache immediately.
 # Call after deactivating a user or changing their permissions.
 ```
 
-### `tokenforge.cookies`
+### `tokenforge.security.cookies`
 
 ```python
-set_refresh_cookie(response, raw_token: str) -> None
+RefreshCookie(response).set(raw_token: str) -> None
 # Set the refresh_token HttpOnly cookie using TOKENFORGE settings.
 
-expire_refresh_cookie(response) -> None
+RefreshCookie(response).expire() -> None
 # Expire the refresh_token cookie (Max-Age=0).
 ```
 
-### `tokenforge.fingerprinting`
+### `tokenforge.security.fingerprinting`
 
 ```python
-fingerprint_for_request(request) -> str
+RequestFingerprint(request).compute() -> str
 # Returns: SHA-256 hex digest of "ip|user_agent"
 
-get_client_ip(request) -> str
+RequestFingerprint(request).client_ip() -> str
 # Returns: real client IP using NUM_PROXIES-aware X-Forwarded-For extraction
 ```
 
@@ -1122,9 +1275,9 @@ get_token_model() -> type[Model]
 ### `tokenforge.signals`
 
 ```python
-token_rotated    # kwargs: sender, user, request
-token_revoked    # kwargs: sender, family, count, reason
-replay_detected  # kwargs: sender, user, family, request
+TokenSignals.rotated    # kwargs: sender, user, request
+TokenSignals.revoked    # kwargs: sender, family, count, reason
+TokenSignals.replay_detected  # kwargs: sender, user, family, request
 ```
 
 ---

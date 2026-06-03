@@ -2,233 +2,193 @@
 Exchange Token Service — one-time cross-subdomain auth handoff via Redis.
 
 Flow:
-  1. Authenticated user on base domain calls create_exchange_token()
+  1. Authenticated user on base domain calls ExchangeTokenService.create()
   2. Server stores {user_id, session_id, fingerprint, target_origin} in Redis (60s TTL)
-  3. User is redirected to target subdomain with ?token=<exchange_token> in URL
-  4. Subdomain calls redeem_exchange_token() → gets auth context → issues new tokens
+  3. User is redirected to target subdomain with #token=<exchange_token> in URL
+  4. Subdomain calls ExchangeTokenService.redeem() → auth context → issues new tokens
   5. Redis key is deleted on redeem (single-use)
 
 Security:
   - 60-second TTL prevents stale tokens from being useful
-  - Single-use: deleted from Redis on redemption
-  - Origin binding: target_origin must match the requesting origin
+  - Single-use: atomic claim, deleted from Redis on redemption
+  - Origin binding: target_origin must be allowlisted and match the redeemer
+  - Device-fingerprint binding on redemption (EXCHANGE_FINGERPRINT_STRICT)
   - High entropy: 48 bytes (384 bits) of cryptographic randomness
   - Rate-limited at the view layer
 """
 
-import json
+import hmac
 import logging
-import secrets
 from urllib.parse import urlparse
 
-from django.core.cache import cache
+from tokenforge.tokens import OneTimeStore
 
 logger = logging.getLogger("tokenforge")
 
-_CACHE_KEY_PREFIX = "tokenforge:exchange:"
 
+class ExchangeTokenService:
+    """Create / redeem one-time cross-subdomain exchange tokens.
 
-def _get_ttl() -> int:
-    from tokenforge.settings import tokenforge_settings
-
-    return int(tokenforge_settings.EXCHANGE_TOKEN_TTL_SECONDS)
-
-
-def _get_bytes() -> int:
-    from tokenforge.settings import tokenforge_settings
-
-    return int(tokenforge_settings.EXCHANGE_TOKEN_BYTES)
-
-
-def _get_max_active() -> int:
-    from tokenforge.settings import tokenforge_settings
-
-    return int(tokenforge_settings.EXCHANGE_TOKEN_MAX_ACTIVE)
-
-
-def _cache_key(token: str) -> str:
-    return f"{_CACHE_KEY_PREFIX}{token}"
-
-
-def _normalize_origin(origin: str) -> str:
+    Stateless (all state lives in the cache via the OneTimeStore), so the public
+    surface is classmethods.
     """
-    Normalize an origin URL for comparison.
 
-    Strips trailing slashes and lowercases the scheme + host.
-    Keeps port if present.
-    """
-    origin = origin.strip().rstrip("/").lower()
-    parsed = urlparse(origin)
-    if parsed.scheme and parsed.netloc:
-        return f"{parsed.scheme}://{parsed.netloc}"
-    return origin
+    # Stored under the "exchange" namespace → cache key "tokenforge:exchange:<token>".
+    NAMESPACE = "exchange"
+    _store = OneTimeStore(NAMESPACE)
 
+    # ── helpers ──────────────────────────────────────────
+    @staticmethod
+    def _normalize_origin(origin: str) -> str:
+        """Normalize an origin URL for comparison: strip trailing slashes,
+        lowercase scheme + host, keep port."""
+        origin = origin.strip().rstrip("/").lower()
+        parsed = urlparse(origin)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+        return origin
 
-# ─────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────
+    @classmethod
+    def _check_target_origin_allowed(cls, normalized_origin: str) -> None:
+        """Enforce EXCHANGE_ALLOWED_ORIGINS (2.0: fail-closed). Raises ValueError
+        if the (normalised) target origin is not on the allowlist. When the
+        allowlist is unset or empty, EVERY origin is refused — you must list your
+        known subdomains to mint an exchange token, so a token can never be created
+        for an attacker origin.
+        """
+        from tokenforge.settings import tokenforge_settings
 
-
-def create_exchange_token(
-    *,
-    user_id: str,
-    device_session_id: str,
-    fingerprint: str = "",
-    target_origin: str,
-) -> str:
-    """
-    Create a one-time exchange token and store in Redis.
-
-    Args:
-        user_id: UUID of the authenticated user.
-        device_session_id: UUID of the current device session.
-        fingerprint: SHA-256(IP|UA) for binding verification.
-        target_origin: The origin the token is valid for.
-
-    Returns:
-        The raw exchange token string (to be passed in URL query param).
-    """
-    token = secrets.token_urlsafe(_get_bytes())
-    ttl = _get_ttl()
-
-    payload = {
-        "sub": str(user_id),
-        "sid": str(device_session_id),
-        "fp": fingerprint,
-        "target_origin": _normalize_origin(target_origin),
-    }
-
-    cache.set(_cache_key(token), json.dumps(payload), timeout=ttl)
-
-    logger.info(
-        "Exchange token created: user=%s, target=%s, ttl=%ds",
-        user_id,
-        target_origin,
-        ttl,
-    )
-
-    return token
-
-
-def redeem_exchange_token(
-    *,
-    token: str,
-    request_origin: str = "",
-) -> dict[str, str]:
-    """
-    Redeem a one-time exchange token.
-
-    Validates the token exists in Redis, checks origin binding,
-    deletes the token (single-use), and returns the auth context.
-
-    The active-token counter is always decremented when a token is consumed
-    (deleted from Redis), regardless of whether subsequent validation passes.
-    This prevents counter leaks when tokens are rejected after deletion.
-
-    Args:
-        token: The raw exchange token from the URL query param.
-        request_origin: The Origin or Referer header from the request.
-
-    Returns:
-        Dict with keys: sub, sid, fp, target_origin
-
-    Raises:
-        ValueError: On any validation failure.
-    """
-    if not token:
-        raise ValueError("Exchange token is required")
-
-    key = _cache_key(token)
-    raw_payload = cache.get(key)
-
-    if raw_payload is None:
-        raise ValueError("Exchange token is invalid or expired")
-
-    # Delete immediately (single-use) — even if validation below fails,
-    # we don't want the token to be reusable.
-    cache.delete(key)
-
-    try:
-        payload = json.loads(raw_payload)
-    except (json.JSONDecodeError, TypeError) as e:
-        logger.error("Corrupt exchange token payload for token (deleted)")
-        raise ValueError("Exchange token payload corrupted") from e
-
-    # Always decrement the counter now that the token has been consumed.
-    # This runs before validation so counter is decremented even on failure.
-    user_id = payload.get("sub", "")
-    if user_id:
-        decrement_exchange_counter(user_id)
-
-    # Validate required fields
-    for field in ("sub", "sid"):
-        if not payload.get(field):
-            raise ValueError(f"Exchange token missing required field: {field}")
-
-    # Origin binding check — if the token has a target_origin, enforce it.
-    # Missing Origin/Referer header is treated as a mismatch when binding is set.
-    target_origin = payload.get("target_origin", "")
-    if target_origin:
-        if not request_origin:
-            logger.warning(
-                "Exchange token redeemed without Origin header: user=%s, expected=%s",
-                user_id,
-                target_origin,
+        allowed = tokenforge_settings.EXCHANGE_ALLOWED_ORIGINS
+        if not allowed:
+            raise ValueError(
+                "TOKENFORGE['EXCHANGE_ALLOWED_ORIGINS'] is not set — exchange token creation "
+                "is refused (fail-closed). Set it to your known subdomains to use the exchange flow."
             )
-            raise ValueError("Exchange token origin verification failed")
+        allowed_set = {cls._normalize_origin(o) for o in allowed}
+        if normalized_origin not in allowed_set:
+            raise ValueError("Exchange target origin is not allowed")
 
-        normalized_request = _normalize_origin(request_origin)
-        normalized_target = target_origin
-        if normalized_request != normalized_target:
-            logger.warning(
-                "Exchange token origin mismatch: expected=%s, got=%s, user=%s",
-                normalized_target,
-                normalized_request,
-                user_id,
-            )
-            raise ValueError("Exchange token origin mismatch")
+    # ── public API ───────────────────────────────────────
+    @classmethod
+    def create(
+        cls,
+        *,
+        user_id: str,
+        device_session_id: str,
+        fingerprint: str = "",
+        target_origin: str,
+    ) -> str:
+        """Create a one-time exchange token and store it.
 
-    logger.info(
-        "Exchange token redeemed: user=%s, origin=%s",
-        user_id,
-        request_origin,
-    )
+        Returns the raw exchange token (delivered to the target subdomain, ideally
+        in the URL fragment — see the SD-4 README note). Raises ValueError if the
+        target origin is not allowlisted.
+        """
+        from tokenforge.settings import tokenforge_settings
 
-    return dict(payload)
+        ttl = int(tokenforge_settings.EXCHANGE_TOKEN_TTL_SECONDS)
+        normalized_origin = cls._normalize_origin(target_origin)
+        cls._check_target_origin_allowed(normalized_origin)
 
+        payload = {
+            "sub": str(user_id),
+            "sid": str(device_session_id),
+            "fp": fingerprint,
+            "target_origin": normalized_origin,
+        }
 
-def count_active_exchange_tokens(user_id: str) -> int:
-    """
-    Count active exchange tokens for a user.
+        token = cls._store.create(
+            payload, ttl=ttl, nbytes=int(tokenforge_settings.EXCHANGE_TOKEN_BYTES)
+        )
+        # Track for the per-user active cap. Pruned-on-read, so an unredeemed token
+        # that simply expires stops counting on its own (no counter drift).
+        cls._store.track(str(user_id), token, ttl=ttl)
 
-    Uses a secondary counter key in Redis to track outstanding tokens.
-    """
-    counter_key = f"tokenforge:exchange_count:{user_id}"
-    count = cache.get(counter_key)
-    return int(count) if count else 0
+        logger.info(
+            "Exchange token created: user=%s, target=%s, ttl=%ds", user_id, target_origin, ttl
+        )
+        return token
 
+    @classmethod
+    def redeem(
+        cls,
+        *,
+        token: str,
+        request_origin: str = "",
+        request_fingerprint: str = "",
+    ) -> dict[str, str]:
+        """Redeem a one-time exchange token.
 
-def increment_exchange_counter(user_id: str) -> None:
-    """Increment the exchange token counter for a user."""
-    counter_key = f"tokenforge:exchange_count:{user_id}"
-    ttl = _get_ttl() * 2  # Counter lives slightly longer than any single token
-    # Use cache.add (atomic create-if-not-exists) to avoid race conditions
-    # between cache.incr failing and cache.set overwriting a concurrent write.
-    if cache.add(counter_key, 0, timeout=ttl):
-        pass  # Key created with value 0, incr below will make it 1
-    try:
-        cache.incr(counter_key)
-    except ValueError:
-        # Fallback: key may have expired between add and incr
-        cache.set(counter_key, 1, timeout=ttl)
+        Atomically claims the token, checks origin + fingerprint binding, and
+        returns the auth context {sub, sid, fp, target_origin}. The active count
+        is released before validation so a rejected redeem doesn't leak the slot.
 
+        Raises ValueError on any validation failure.
+        """
+        if not token:
+            raise ValueError("Exchange token is required")
 
-def decrement_exchange_counter(user_id: str) -> None:
-    """Decrement the exchange token counter for a user."""
-    counter_key = f"tokenforge:exchange_count:{user_id}"
-    try:
-        val = cache.decr(counter_key)
-        if val <= 0:
-            cache.delete(counter_key)
-    except ValueError:
-        pass
+        # Atomic single-use claim. Fixes the get-then-delete race where two
+        # concurrent redemptions could both read the payload before either deleted
+        # it; claim() guarantees exactly one redemption wins.
+        payload = cls._store.claim(token)
+        if payload is None:
+            raise ValueError("Exchange token is invalid or expired")
+
+        # The token has been consumed — release the user's active slot now, before
+        # validation, so the count is freed even if a later check rejects it.
+        user_id = payload.get("sub", "")
+        if user_id:
+            cls._store.untrack(str(user_id), token)
+
+        # Validate required fields
+        for field in ("sub", "sid"):
+            if not payload.get(field):
+                raise ValueError(f"Exchange token missing required field: {field}")
+
+        # Origin binding check — if the token has a target_origin, enforce it.
+        # Missing Origin header is treated as a mismatch when binding is set.
+        target_origin = payload.get("target_origin", "")
+        if target_origin:
+            if not request_origin:
+                logger.warning(
+                    "Exchange token redeemed without Origin header: user=%s, expected=%s",
+                    user_id,
+                    target_origin,
+                )
+                raise ValueError("Exchange token origin verification failed")
+
+            if cls._normalize_origin(request_origin) != target_origin:
+                logger.warning(
+                    "Exchange token origin mismatch: expected=%s, got=%s, user=%s",
+                    target_origin,
+                    cls._normalize_origin(request_origin),
+                    user_id,
+                )
+                raise ValueError("Exchange token origin mismatch")
+
+        # Device-fingerprint binding. The stored fp is the 16-char prefix bound at
+        # creation; compare it to the redeeming request's fingerprint so a leaked
+        # token (it rides in a URL) can't be redeemed from another device.
+        # Hard-fails only when EXCHANGE_FINGERPRINT_STRICT is on (2.0 default).
+        stored_fp = str(payload.get("fp", ""))
+        if stored_fp and request_fingerprint:
+            from tokenforge.settings import tokenforge_settings
+
+            if not hmac.compare_digest(stored_fp, request_fingerprint[:16]):
+                logger.warning("Exchange token fingerprint drift: user=%s", user_id)
+                if tokenforge_settings.EXCHANGE_FINGERPRINT_STRICT:
+                    raise ValueError("Exchange token fingerprint mismatch")
+
+        logger.info("Exchange token redeemed: user=%s, origin=%s", user_id, request_origin)
+        return dict(payload)
+
+    @classmethod
+    def count_active(cls, user_id: str) -> int:
+        """Count a user's outstanding (non-expired) exchange tokens.
+
+        Backed by the OneTimeStore's pruned-on-read active set, so a token that
+        expired without being redeemed no longer counts — unlike the old incr/decr
+        integer counter, which drifted upward on every unredeemed expiry.
+        """
+        return cls._store.count_active(str(user_id))

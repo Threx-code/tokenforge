@@ -22,23 +22,60 @@ from django.http import HttpRequest
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
 
-from .tokens import verify_access_token
+from tokenforge.security.fingerprinting import RequestFingerprint
+from tokenforge.tokens import AccessToken, AccessTokenDenylist
 
 logger = logging.getLogger("tokenforge")
 
 User = get_user_model()
 
-_USER_CACHE_PREFIX = "tokenforge:user:"
 
+class UserCache:
+    """Caches authenticated ``User`` objects so the auth path stays DB-free.
 
-def invalidate_user_cache(user_id: str) -> None:
+    Caches only active users; a cached user that has since been deactivated is
+    detected (stale ``is_active``) and re-fetched.
     """
-    Remove a user from the tokenforge auth cache.
 
-    Call this when a user is deactivated, deleted, or their permissions change,
-    so the next request triggers a fresh DB lookup.
-    """
-    cache.delete(f"{_USER_CACHE_PREFIX}{user_id}")
+    _PREFIX = "tokenforge:user:"
+
+    @classmethod
+    def _key(cls, user_id: str) -> str:
+        return f"{cls._PREFIX}{user_id}"
+
+    @classmethod
+    def invalidate(cls, user_id: str) -> None:
+        """Remove a user from the auth cache.
+
+        Call this when a user is deactivated, deleted, or their permissions
+        change, so the next request triggers a fresh DB lookup.
+        """
+        cache.delete(cls._key(user_id))
+
+    @classmethod
+    def get(cls, user_id: str) -> Any | None:
+        """Load a user by id, with caching. Returns None if missing/inactive."""
+        from tokenforge.settings import tokenforge_settings
+
+        cache_key = cls._key(user_id)
+        user = cache.get(cache_key)
+
+        if user is not None:
+            # Guard against stale cache: if the user was deactivated since
+            # caching, evict and re-fetch from DB to confirm.
+            if not user.is_active:
+                cache.delete(cache_key)
+                return None
+            return user
+
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return None
+
+        if user.is_active:  # only cache active users
+            cache.set(cache_key, user, timeout=tokenforge_settings.USER_CACHE_TTL)
+        return user
 
 
 class BearerTokenAuthentication(BaseAuthentication):
@@ -48,7 +85,7 @@ class BearerTokenAuthentication(BaseAuthentication):
     Usage:
         REST_FRAMEWORK = {
             "DEFAULT_AUTHENTICATION_CLASSES": [
-                "tokenforge.authentication.BearerTokenAuthentication",
+                "tokenforge.security.authentication.BearerTokenAuthentication",
             ],
         }
     """
@@ -80,13 +117,28 @@ class BearerTokenAuthentication(BaseAuthentication):
         # Verify token (stateless HMAC check)
         try:
             request_fingerprint = self._get_request_fingerprint(request)
-            payload = verify_access_token(
+            payload = AccessToken.verify(
                 token_string,
                 request_fingerprint=request_fingerprint,
             )
         except ValueError as e:
             logger.warning("Bearer token verification failed: %s", str(e))
             raise AuthenticationFailed("Authentication failed") from e
+        except Exception as e:
+            # Defense-in-depth: a malformed token must never crash the request
+            # with a 500. Any unexpected error during verification → auth failure.
+            logger.warning("Bearer token verification error: %s", str(e))
+            raise AuthenticationFailed("Authentication failed") from e
+
+        # Denylist (kill-switch) — only when enabled, one cache GET. Lets logout /
+        # compromise revoke this access token before its natural expiry.
+        from tokenforge.settings import tokenforge_settings
+
+        if tokenforge_settings.ACCESS_TOKEN_DENYLIST_ENABLED and AccessTokenDenylist.contains(
+            str(payload.get("jti", ""))
+        ):
+            logger.warning("Bearer token is denylisted: jti=%s", payload.get("jti"))
+            raise AuthenticationFailed("Authentication failed")
 
         # Load user
         user_id = payload.get("sub")
@@ -94,7 +146,7 @@ class BearerTokenAuthentication(BaseAuthentication):
             logger.warning("Bearer token missing 'sub' claim")
             raise AuthenticationFailed("Authentication failed")
 
-        user = self._get_user(str(user_id))
+        user = UserCache.get(str(user_id))
         if user is None:
             logger.warning("Bearer token references non-existent user: %s", user_id)
             raise AuthenticationFailed("Authentication failed")
@@ -109,6 +161,7 @@ class BearerTokenAuthentication(BaseAuthentication):
             "sid": payload.get("sid", ""),
             "fp": payload.get("fp", ""),
             "tnt": payload.get("tnt", ""),
+            "jti": payload.get("jti", ""),
             "iat": payload.get("iat"),
             "exp": payload.get("exp"),
             "v": payload.get("v", ""),
@@ -120,40 +173,13 @@ class BearerTokenAuthentication(BaseAuthentication):
     def authenticate_header(self, request: HttpRequest) -> str:
         return f'{self.keyword} realm="api"'
 
-    def _get_user(self, user_id: str) -> Any | None:
-        """Load user by UUID, with caching.
-
-        Caches only active users. If the cached user has been deactivated
-        since caching, we detect the stale flag and re-fetch from DB.
-        """
-        from tokenforge.settings import tokenforge_settings
-
-        cache_ttl = tokenforge_settings.USER_CACHE_TTL
-
-        cache_key = f"{_USER_CACHE_PREFIX}{user_id}"
-        user = cache.get(cache_key)
-
-        if user is not None:
-            # Guard against stale cache: if user was deactivated since caching,
-            # evict from cache and re-fetch from DB to confirm.
-            if not user.is_active:
-                cache.delete(cache_key)
-                return None
-            return user
-
-        try:
-            user = User.objects.get(id=user_id)
-        except User.DoesNotExist:
-            return None
-
-        # Only cache active users
-        if user.is_active:
-            cache.set(cache_key, user, timeout=cache_ttl)
-        return user
-
     @staticmethod
     def _get_request_fingerprint(request: HttpRequest) -> str | None:
-        """Compute fingerprint for the current request via configurable function."""
+        """Compute the fingerprint for the current request.
+
+        Uses the optional FINGERPRINT_FUNCTION callable hook when configured,
+        otherwise the built-in RequestFingerprint.
+        """
         from tokenforge.settings import tokenforge_settings
 
         if not tokenforge_settings.FINGERPRINT_ENABLED:
@@ -161,6 +187,8 @@ class BearerTokenAuthentication(BaseAuthentication):
 
         try:
             fingerprint_fn = tokenforge_settings.FINGERPRINT_FUNCTION
-            return str(fingerprint_fn(request))
+            if fingerprint_fn:
+                return str(fingerprint_fn(request))
+            return RequestFingerprint(request).compute()
         except Exception:
             return None

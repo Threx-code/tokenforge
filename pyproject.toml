@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-tokenforge"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Stateless Bearer token authentication for Django REST Framework — HMAC-SHA256 access tokens, rotating refresh tokens with replay detection, and cross-subdomain exchange tokens."
 readme = "README.md"
 license = "MIT"
@@ -72,6 +72,10 @@ Documentation = "https://github.com/Threx-code/tokenforge#readme"
 Repository = "https://github.com/Threx-code/tokenforge.git"
 "Bug Tracker" = "https://github.com/Threx-code/tokenforge/issues"
 Changelog = "https://github.com/Threx-code/tokenforge/blob/main/CHANGELOG.md"
+
+[tool.setuptools.dynamic]
+# Single source of truth for the version: tokenforge/__init__.py __version__.
+version = { attr = "tokenforge.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]

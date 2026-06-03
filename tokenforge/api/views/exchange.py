@@ -1,136 +1,24 @@
-"""
-TokenForge views — token refresh and cross-subdomain exchange endpoints.
-
-Endpoints:
-  POST /token/refresh/     — exchange refresh_token cookie for new tokens
-  POST /exchange/create/   — create a one-time exchange token (requires auth)
-  POST /exchange/redeem/   — redeem exchange token to get access + refresh tokens
-
-All views use standard DRF GenericAPIView — no dependency on project-specific
-base classes (GuestAPI, AuthAPI). Consuming apps can subclass and override.
-"""
+"""Cross-subdomain SSO handoff — create and redeem one-time exchange tokens."""
 
 import contextlib
-import logging
 from typing import Any
 
 from django.contrib.auth import get_user_model
-from django.db.models import Model
 from rest_framework import status
-from rest_framework.generics import GenericAPIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
-from tokenforge.cookies import expire_refresh_cookie, set_refresh_cookie
-from tokenforge.serializers import ExchangeCreateSerializer, ExchangeRedeemSerializer
-from tokenforge.services.exchange import (
-    count_active_exchange_tokens,
-    create_exchange_token,
-    increment_exchange_counter,
-    redeem_exchange_token,
-)
-from tokenforge.services.refresh import create_refresh_token, rotate_refresh_token
-from tokenforge.tokens import create_access_token
-
-logger = logging.getLogger("tokenforge")
+from tokenforge.api.serializers import ExchangeCreateSerializer, ExchangeRedeemSerializer
+from tokenforge.api.views.base import BaseTokenView, logger
+from tokenforge.security import RefreshCookie
+from tokenforge.services.exchange import ExchangeTokenService
+from tokenforge.services.refresh import RefreshTokenService
+from tokenforge.tokens import AccessToken
 
 
-class TokenRefreshView(GenericAPIView[Model]):
-    """
-    Exchange a valid refresh_token cookie for a new access token + rotated refresh token.
-
-    Request:
-        POST /token/refresh/
-        Cookie: refresh_token=<raw_token>
-        Header: X-Requested-With: XMLHttpRequest (required, anti-CSRF)
-
-    Response 200:
-        {"access_token": "<new_access_token>", "expires_in": 900}
-        Set-Cookie: refresh_token=<new_raw_token> (HttpOnly)
-    """
-
-    authentication_classes = []
-    permission_classes = [AllowAny]
-    throttle_classes = [ScopedRateThrottle]
-    throttle_scope = "refresh_token"
-
-    def post(self, request: Request, *args: Any, **kwargs: Any) -> Response:
-        from tokenforge.settings import tokenforge_settings
-
-        # ── Anti-CSRF check ──────────────────────────────
-        if tokenforge_settings.REQUIRE_XHR_HEADER:
-            xhr_header = request.META.get("HTTP_X_REQUESTED_WITH", "")
-            if xhr_header != "XMLHttpRequest":
-                logger.warning("Token refresh: missing X-Requested-With header")
-                return Response(
-                    {"detail": "Authentication failed"},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
-
-        # ── Extract refresh token from cookie ────────────
-        cookie_name = tokenforge_settings.REFRESH_TOKEN_COOKIE_NAME
-        raw_token = request.COOKIES.get(cookie_name)
-        if not raw_token:
-            return Response(
-                {"detail": "Session expired"},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
-
-        # Guard against oversized cookie values (max expected: ~128 chars)
-        if len(raw_token) > 512:
-            logger.warning("Token refresh: oversized cookie value (%d bytes)", len(raw_token))
-            return Response(
-                {"detail": "Session expired"},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
-
-        # ── Compute current fingerprint ──────────────────
-        fingerprint_fn = tokenforge_settings.FINGERPRINT_FUNCTION
-        fingerprint = fingerprint_fn(request) if fingerprint_fn else ""
-
-        # ── Rotate refresh token ─────────────────────────
-        try:
-            new_raw_token, new_instance = rotate_refresh_token(
-                raw_token=raw_token,
-                fingerprint=fingerprint,
-                request=request,
-            )
-        except ValueError as e:
-            logger.warning("Token refresh failed: %s", str(e))
-            response = Response(
-                {"detail": "Session expired"},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
-            expire_refresh_cookie(response)
-            return response
-
-        # ── Create new access token ──────────────────────
-        device_session = getattr(new_instance, "device_session", None)
-        tenant_slug = request.META.get("HTTP_X_TENANT_SLUG", "")
-
-        access_token, expires_in = create_access_token(
-            user_id=str(new_instance.user_id),
-            device_session_id=str(device_session.id) if device_session else "",
-            fingerprint=fingerprint,
-            tenant_slug=tenant_slug,
-        )
-
-        # ── Build response ───────────────────────────────
-        response = Response(
-            {
-                "access_token": access_token,
-                "expires_in": expires_in,
-            },
-            status=status.HTTP_200_OK,
-        )
-
-        set_refresh_cookie(response, new_raw_token)
-        return response
-
-
-class ExchangeCreateView(GenericAPIView[Model]):
+class ExchangeCreateView(BaseTokenView):
     """
     Create a one-time exchange token for cross-subdomain navigation.
 
@@ -158,8 +46,7 @@ class ExchangeCreateView(GenericAPIView[Model]):
 
         # ── Rate limit: max concurrent exchange tokens ───
         max_active = tokenforge_settings.EXCHANGE_TOKEN_MAX_ACTIVE
-        active_count = count_active_exchange_tokens(user_id)
-        if active_count >= max_active:
+        if ExchangeTokenService.count_active(user_id) >= max_active:
             return Response(
                 {"detail": "Too many pending exchange tokens"},
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -171,13 +58,22 @@ class ExchangeCreateView(GenericAPIView[Model]):
         fingerprint = str(auth_context.get("fp", ""))
 
         # ── Create exchange token ────────────────────────
-        token = create_exchange_token(
-            user_id=user_id,
-            device_session_id=device_session_id,
-            fingerprint=fingerprint,
-            target_origin=target_origin,
-        )
-        increment_exchange_counter(user_id)
+        # ExchangeTokenService.create raises ValueError when the target origin is
+        # not on EXCHANGE_ALLOWED_ORIGINS (2.0 fail-closed when unset). Surface
+        # that as a 403 rather than a 500.
+        try:
+            token = ExchangeTokenService.create(
+                user_id=user_id,
+                device_session_id=device_session_id,
+                fingerprint=fingerprint,
+                target_origin=target_origin,
+            )
+        except ValueError as e:
+            logger.warning("Exchange create rejected: %s", str(e))
+            return Response(
+                {"detail": "Exchange target origin is not allowed"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         return Response(
             {
@@ -188,7 +84,7 @@ class ExchangeCreateView(GenericAPIView[Model]):
         )
 
 
-class ExchangeRedeemView(GenericAPIView[Model]):
+class ExchangeRedeemView(BaseTokenView):
     """
     Redeem a one-time exchange token to get access + refresh tokens.
 
@@ -224,14 +120,16 @@ class ExchangeRedeemView(GenericAPIView[Model]):
         # Referer is intentionally excluded: it includes the full path (leaks
         # sensitive URL params), is not sent in all cases, and is not a security
         # boundary. An absent Origin header is treated as a mismatch by
-        # redeem_exchange_token() when a target_origin is set.
+        # ExchangeTokenService.redeem() when a target_origin is set.
         request_origin = request.META.get("HTTP_ORIGIN", "")
+        request_fingerprint = self.request_fingerprint(request)
 
         # ── Redeem the exchange token ────────────────────
         try:
-            payload = redeem_exchange_token(
+            payload = ExchangeTokenService.redeem(
                 token=exchange_token,
                 request_origin=request_origin,
+                request_fingerprint=request_fingerprint,
             )
         except ValueError as e:
             logger.warning("Exchange redeem failed: %s", str(e))
@@ -264,20 +162,19 @@ class ExchangeRedeemView(GenericAPIView[Model]):
                     device_session = loader(device_session_id, user)
 
         # ── Compute fingerprint ──────────────────────────
-        fingerprint_fn = tokenforge_settings.FINGERPRINT_FUNCTION
-        fingerprint = fingerprint_fn(request) if fingerprint_fn else ""
+        fingerprint = self.request_fingerprint(request)
 
         # ── Create new refresh token ─────────────────────
-        raw_refresh, refresh_instance = create_refresh_token(
+        raw_refresh, refresh_instance = RefreshTokenService.create(
             user=user,
             device_session=device_session,
             fingerprint=fingerprint,
         )
 
         # ── Create access token ──────────────────────────
-        tenant_slug = request.META.get("HTTP_X_TENANT_SLUG", "")
+        tenant_slug = self.resolve_tenant(request, user)
 
-        access_token, expires_in = create_access_token(
+        access_token, expires_in = AccessToken.create(
             user_id=str(user.id),
             device_session_id=str(device_session.id) if device_session else "",
             fingerprint=fingerprint,
@@ -296,5 +193,5 @@ class ExchangeRedeemView(GenericAPIView[Model]):
             response_data["user"] = user_serializer_class(user).data
 
         response = Response(response_data, status=status.HTTP_200_OK)
-        set_refresh_cookie(response, raw_refresh)
+        RefreshCookie(response).set(raw_refresh)
         return response
