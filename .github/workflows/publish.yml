@@ -24,28 +24,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install tomllib / tomli
-        run: pip install tomli; true  # tomllib is stdlib in 3.11+
-
-      - name: Check tag == pyproject.toml version
+      - name: Check tag == package version
         run: |
+          # The version is dynamic (pyproject `dynamic = ["version"]`), sourced
+          # from tokenforge/__init__.py __version__ — read it from there, not from
+          # a non-existent [project].version key.
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          TOML_VERSION=$(python -c "
-          import sys
-          if sys.version_info >= (3, 11):
-              import tomllib
-              with open('pyproject.toml', 'rb') as f:
-                  data = tomllib.load(f)
-          else:
-              import tomli
-              with open('pyproject.toml', 'rb') as f:
-                  data = tomli.load(f)
-          print(data['project']['version'])
-          ")
-          echo "Tag version:    $TAG_VERSION"
-          echo "pyproject.toml: $TOML_VERSION"
-          if [ "$TAG_VERSION" != "$TOML_VERSION" ]; then
-            echo "::error::Tag version ($TAG_VERSION) does not match pyproject.toml ($TOML_VERSION)"
+          PKG_VERSION=$(python -c "import re,pathlib; print(re.search(r'''__version__\s*=\s*['\"]([^'\"]+)['\"]''', pathlib.Path('tokenforge/__init__.py').read_text()).group(1))")
+          echo "Tag version:        $TAG_VERSION"
+          echo "tokenforge version: $PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match tokenforge.__version__ ($PKG_VERSION)"
             exit 1
           fi
 

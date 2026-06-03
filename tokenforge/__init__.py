@@ -12,8 +12,7 @@ Quick start:
   1. Add "tokenforge" to INSTALLED_APPS
   2. Add TOKENFORGE = {...} to settings
   3. Add path("auth/", include("tokenforge.urls")) to urls
-  4. Set REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"] = ["tokenforge.authentication.BearerTokenAuthentication"]
+  4. Set REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"] = ["tokenforge.security.authentication.BearerTokenAuthentication"]
 """
 
-__version__ = "1.0.0"
-default_app_config = "tokenforge.apps.TokenForgeConfig"
+__version__ = "2.0.0"

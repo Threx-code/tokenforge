@@ -2,20 +2,28 @@
 TokenForge signals — hook into token lifecycle events.
 
 Usage:
-    from tokenforge.signals import token_rotated
+    from tokenforge.signals import TokenSignals
 
-    @receiver(token_rotated)
+    @receiver(TokenSignals.rotated)
     def on_token_rotated(sender, user, request, **kwargs):
         ...
 """
 
 from django.dispatch import Signal
 
-# Fired after a refresh token is successfully rotated
-token_rotated = Signal()  # sender=TokenModel, user=user, request=request
 
-# Fired after tokens are revoked
-token_revoked = Signal()  # sender=TokenModel, family=uuid, count=int, reason=str
+class TokenSignals:
+    """Namespace of the token-lifecycle Django signals.
 
-# Fired when replay attack is detected (revoked token reused)
-replay_detected = Signal()  # sender=TokenModel, user=user, family=uuid, request=request
+    Class attributes (each a ``django.dispatch.Signal``):
+      rotated         — after a refresh token is successfully rotated.
+                        sender=TokenModel, user=user, request=request
+      revoked         — after tokens are revoked.
+                        sender=TokenModel, family=uuid, count=int, reason=str
+      replay_detected — when a revoked token is reused.
+                        sender=TokenModel, user=user, family=uuid, request=request
+    """
+
+    rotated = Signal()
+    revoked = Signal()
+    replay_detected = Signal()

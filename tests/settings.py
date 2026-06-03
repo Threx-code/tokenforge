@@ -56,7 +56,7 @@ TOKENFORGE_TOKEN_MODEL = "tokenforge.RefreshToken"
 # ── DRF ──────────────────────────────────────────────────────────────────────
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "tokenforge.authentication.BearerTokenAuthentication",
+        "tokenforge.security.authentication.BearerTokenAuthentication",
     ],
     "DEFAULT_THROTTLE_RATES": {
         "refresh_token": "1000/minute",

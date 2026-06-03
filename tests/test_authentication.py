@@ -1,5 +1,5 @@
 """
-Tests for tokenforge.authentication — BearerTokenAuthentication.
+Tests for tokenforge.security.authentication — BearerTokenAuthentication.
 """
 
 import pytest
@@ -8,8 +8,8 @@ from django.core.cache import cache
 from django.test import RequestFactory
 from rest_framework.exceptions import AuthenticationFailed
 
-from tokenforge.authentication import BearerTokenAuthentication, invalidate_user_cache
-from tokenforge.tokens import create_access_token
+from tokenforge.security.authentication import BearerTokenAuthentication, UserCache
+from tokenforge.tokens import AccessToken
 
 User = get_user_model()
 pytestmark = pytest.mark.django_db
@@ -38,7 +38,7 @@ def inactive_user(db):
 
 
 def make_token(user_id, **kwargs):
-    token, _ = create_access_token(user_id=str(user_id), **kwargs)
+    token, _ = AccessToken.create(user_id=str(user_id), **kwargs)
     return token
 
 
@@ -174,7 +174,7 @@ class TestAuthenticateHeader:
         assert "realm" in header
 
 
-# ── invalidate_user_cache ─────────────────────────────────────────────────────
+# ── UserCache.invalidate ─────────────────────────────────────────────────────
 
 
 class TestInvalidateUserCache:
@@ -183,7 +183,7 @@ class TestInvalidateUserCache:
         request = make_request(user_id=user.id)
         BearerTokenAuthentication().authenticate(request)
         # Then invalidate — must not raise
-        invalidate_user_cache(str(user.id))
+        UserCache.invalidate(str(user.id))
 
     def test_after_invalidation_user_reloaded_from_db(self, user):
         auth = BearerTokenAuthentication()
@@ -191,14 +191,14 @@ class TestInvalidateUserCache:
         request = make_request(user_id=user.id)
         auth.authenticate(request)
         # Invalidate
-        invalidate_user_cache(str(user.id))
+        UserCache.invalidate(str(user.id))
         # Authenticate again — should re-fetch from DB and succeed
         result = auth.authenticate(make_request(user_id=user.id))
         assert result is not None
         assert result[0].pk == user.pk
 
     def test_invalidate_nonexistent_key_does_not_raise(self):
-        invalidate_user_cache("00000000-0000-0000-0000-000000000001")
+        UserCache.invalidate("00000000-0000-0000-0000-000000000001")
 
 
 # ── user caching behaviour ────────────────────────────────────────────────────
@@ -232,7 +232,7 @@ class TestUserCaching:
             # Deactivate user in DB and invalidate the cache
             user.is_active = False
             user.save()
-            invalidate_user_cache(str(user.id))
+            UserCache.invalidate(str(user.id))
 
             # Next request should re-fetch from DB and reject the inactive user
             request2 = factory.get("/")

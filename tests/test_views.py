@@ -2,14 +2,19 @@
 Tests for tokenforge views — TokenRefreshView, ExchangeCreateView, ExchangeRedeemView.
 """
 
+from contextlib import contextmanager
+
 import pytest
+from django.conf import settings as dj_settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.test import override_settings
 from rest_framework.test import APIClient
 
-from tokenforge.services.exchange import create_exchange_token
-from tokenforge.services.refresh import create_refresh_token
-from tokenforge.tokens import create_access_token
+from tokenforge.services.exchange import ExchangeTokenService
+from tokenforge.services.refresh import RefreshTokenService
+from tokenforge.settings import reload_settings
+from tokenforge.tokens import AccessToken
 
 User = get_user_model()
 pytestmark = pytest.mark.django_db
@@ -18,10 +23,26 @@ pytestmark = pytest.mark.django_db
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 
+@contextmanager
+def tf_settings(**overrides):
+    merged = {**getattr(dj_settings, "TOKENFORGE", {}), **overrides}
+    cm = override_settings(TOKENFORGE=merged)
+    cm.enable()
+    reload_settings()
+    try:
+        yield
+    finally:
+        cm.disable()
+        reload_settings()
+
+
 @pytest.fixture(autouse=True)
 def clear_cache():
+    # Allowlist the test origin — exchange creation is fail-closed (2.0) when
+    # EXCHANGE_ALLOWED_ORIGINS is unset.
     cache.clear()
-    yield
+    with tf_settings(EXCHANGE_ALLOWED_ORIGINS=["https://app.example.com"]):
+        yield
     cache.clear()
 
 
@@ -39,7 +60,7 @@ def client():
 def auth_client(user):
     """APIClient with a valid Bearer token for the test user."""
     client = APIClient()
-    access_token, _ = create_access_token(
+    access_token, _ = AccessToken.create(
         user_id=str(user.id),
         device_session_id="sess-view-test",
         fingerprint="",
@@ -52,7 +73,7 @@ def auth_client(user):
 def refresh_cookie_client(user):
     """APIClient with a valid refresh_token cookie set."""
     client = APIClient()
-    raw_token, _ = create_refresh_token(user=user, fingerprint="")
+    raw_token, _ = RefreshTokenService.create(user=user, fingerprint="")
     client.cookies["refresh_token"] = raw_token
     return client, user, raw_token
 
@@ -109,7 +130,7 @@ class TestTokenRefreshView:
     def test_expired_cookie_returns_401(self, user):
         from django.utils import timezone
 
-        raw_token, instance = create_refresh_token(user=user)
+        raw_token, instance = RefreshTokenService.create(user=user)
         instance.expires_at = timezone.now() - timezone.timedelta(seconds=1)
         instance.save(update_fields=["expires_at"])
         client = APIClient()
@@ -182,44 +203,22 @@ class TestExchangeCreateView:
         assert resp.status_code == 200
         token = resp.json()["exchange_token"]
 
-        from tokenforge.services.exchange import redeem_exchange_token
+        from tokenforge.services.exchange import ExchangeTokenService
 
-        payload = redeem_exchange_token(token=token, request_origin="https://app.example.com")
+        payload = ExchangeTokenService.redeem(token=token, request_origin="https://app.example.com")
         assert payload["sub"] == str(user.id)
 
-    def test_too_many_tokens_returns_429(self, auth_client, settings):
-        """When max active tokens reached, view returns 429."""
-        settings.TOKENFORGE = {
-            **settings.TOKENFORGE,
-            "EXCHANGE_TOKEN_MAX_ACTIVE": 1,
-        }
-        from tokenforge.settings import reload_settings
-
-        reload_settings()
+    def test_too_many_tokens_returns_429(self, auth_client):
+        """A second create while one token is already active (cap=1) → 429."""
         client, user = auth_client
-        # First token creates the counter
-        r1 = client.post(
-            self.url,
-            {"target_origin": "https://app.example.com"},
-            format="json",
-        )
-        assert r1.status_code == 200
-        # Manually inflate the counter past the limit
-        from tokenforge.services.exchange import increment_exchange_counter
-
-        increment_exchange_counter(str(user.id))  # now at 2, max is 1
-        r2 = client.post(
-            self.url,
-            {"target_origin": "https://app.example.com"},
-            format="json",
-        )
-        assert r2.status_code == 429
-        # Restore
-        settings.TOKENFORGE = {
-            **settings.TOKENFORGE,
-            "EXCHANGE_TOKEN_MAX_ACTIVE": 5,
-        }
-        reload_settings()
+        with tf_settings(
+            EXCHANGE_ALLOWED_ORIGINS=["https://app.example.com"],
+            EXCHANGE_TOKEN_MAX_ACTIVE=1,
+        ):
+            r1 = client.post(self.url, {"target_origin": "https://app.example.com"}, format="json")
+            assert r1.status_code == 200  # count → 1
+            r2 = client.post(self.url, {"target_origin": "https://app.example.com"}, format="json")
+            assert r2.status_code == 429  # count 1 >= cap 1
 
 
 # ── ExchangeRedeemView ────────────────────────────────────────────────────────
@@ -229,7 +228,7 @@ class TestExchangeRedeemView:
     url = "/api/v1/auth/exchange/redeem/"
 
     def _create_token(self, user_id, target_origin="https://app.example.com"):
-        return create_exchange_token(
+        return ExchangeTokenService.create(
             user_id=str(user_id),
             device_session_id="sess-redeem",
             fingerprint="",
@@ -286,7 +285,7 @@ class TestExchangeRedeemView:
     def test_nonexistent_user_returns_401(self, client):
         # Use an integer ID that is unlikely to exist in the test DB
         fake_uid = "99999999"
-        token = create_exchange_token(
+        token = ExchangeTokenService.create(
             user_id=fake_uid,
             device_session_id="s1",
             fingerprint="",
